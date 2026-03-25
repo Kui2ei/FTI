@@ -278,6 +278,20 @@ def compare_with_autoidx(indices: Sequence[int], autoidx_to_rotidx_values: Itera
     }
 
 
+def to_signed_indices(indices: Sequence[int], size: int) -> List[int]:
+    if size <= 0:
+        raise ValueError("size must be positive")
+
+    half = size // 2
+    signed: List[int] = []
+    for v in indices:
+        vv = reduce_rotation(int(v), size)
+        if vv > half:
+            vv -= size
+        signed.append(vv)
+
+    return signed
+
 def main() -> None:
     # parser = argparse.ArgumentParser(
     #     description="Generate pEnc/pDec and bootstrap rotation indices from EvalBootstrapSetup-like inputs."
@@ -325,6 +339,8 @@ def main() -> None:
         dim1_enc=dim1[0],
     )
 
+    indices_signed = to_signed_indices(indices, num_slots)
+
     out = {
         "inputs": {
             "M": M,
@@ -335,7 +351,8 @@ def main() -> None:
         },
         "pEnc": p_enc,
         "pDec": p_dec,
-        "indices": indices,
+        "indices": indices_signed,
+        "indices_unsigned": indices,
     }
 
     # values = parse_int_list(args.autoidx_to_rotidx_values)
