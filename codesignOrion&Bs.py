@@ -1,4 +1,10 @@
-from typing import Dict, Iterable, List, Set, Tuple
+import csv
+from pathlib import Path
+from typing import Dict, Iterable, List, Sequence, Set, Tuple
+
+
+RESULTS_CSV_PATH = Path(__file__).resolve().parent / "results" / "codesign_results.csv"
+BETA_SWEEP_VALUES = [0.0, 0.0001, 0.0003, 0.001, 0.003, 0.01, 0.03, 0.1, 0.3, 1.0, 3.0]
 
 
 def norm_rot_index(i: int, n: int) -> int:
@@ -85,6 +91,30 @@ def _collect_rotation_breakdown(a_diags: Iterable[int], n: int, b_step: int, slo
     return baby | giant, baby, giant
 
 
+def _collect_rotation_breakdown_structural_conj(a_diags: Iterable[int], n: int, b_step: int, slots: int) -> Tuple[Set[int], Set[int], Set[int]]:
+    keylist = {x & (slots - 1) for x in a_diags}
+    baby: Set[int] = set()
+    giant: Set[int] = set()
+    g_step = (slots + b_step - 1) // b_step
+
+    for i in range(1, b_step):
+        if i in keylist:
+            baby.add(_canonical_conj_index(norm_rot_index(i, n), slots))
+
+    for j in range(1, g_step):
+        changed = False
+        if b_step * j in keylist:
+            changed = True
+        for i in range(1, b_step):
+            if b_step * j + i in keylist:
+                baby.add(_canonical_conj_index(norm_rot_index(i, n), slots))
+                changed = True
+        if changed:
+            giant.add(_canonical_conj_index(norm_rot_index(b_step * j, n), slots))
+
+    return baby | giant, baby, giant
+
+
 def evaluate_strategy(a_diags: List[int], n: int, bs_key: List[int], b_step: int, slots: int = 2**15, name: str = "") -> Dict[str, object]:
     needed, baby, giant = _collect_rotation_breakdown(a_diags, n, b_step, slots)
     bs_norm = {norm_rot_index(x & (slots - 1), n) for x in bs_key}
@@ -102,6 +132,24 @@ def evaluate_strategy(a_diags: List[int], n: int, bs_key: List[int], b_step: int
     }
 
 
+def evaluate_strategy_structural_conj(a_diags: List[int], n: int, bs_key: List[int], b_step: int, slots: int = 2**15, name: str = "") -> Dict[str, object]:
+    needed, baby, giant = _collect_rotation_breakdown_structural_conj(a_diags, n, b_step, slots)
+    bs_norm = _collapse_with_conjugation(bs_key, slots)
+    new_only = needed - bs_norm
+    return {
+        "strategy": name or f"n1={b_step}",
+        "b_step": b_step,
+        "g_step": (slots + b_step - 1) // b_step,
+        "needed_all": needed,
+        "new_only": new_only,
+        "reused": needed & bs_norm,
+        "bs_norm": bs_norm,
+        "needed_baby": baby,
+        "needed_giant": giant,
+        "fold_stage": "decomposition",
+    }
+
+
 def bsgs_evaluate_linear_transform(a_diags: List[int], n: int, bs_key: List[int], slots: int = 2**15) -> Dict[str, object]:
     # Ratio baseline in co-design style: choose bStep with A+bsKey, then evaluate on A.
     b_step = _find_best_bsgs_ratio(a_diags + bs_key, slots, log_max_ratio=0)
@@ -115,6 +163,107 @@ def _candidate_bsteps(slots: int) -> List[int]:
         candidates.append(n1)
         n1 <<= 1
     return candidates
+
+
+def _factorizations_of_power_of_two(total_log_slots: int, levels: int, min_log_step: int = 1) -> List[Tuple[int, ...]]:
+    if levels <= 0:
+        return []
+    results: List[Tuple[int, ...]] = []
+
+    def rec(remaining: int, depth: int, prefix: List[int]) -> None:
+        if depth == levels:
+            if remaining == 0:
+                results.append(tuple(1 << x for x in prefix))
+            return
+
+        min_required = (levels - depth - 1) * min_log_step
+        max_here = remaining - min_required
+        for current in range(min_log_step, max_here + 1):
+            prefix.append(current)
+            rec(remaining - current, depth + 1, prefix)
+            prefix.pop()
+
+    rec(total_log_slots, 0, [])
+    return results
+
+
+def _decompose_rotation_steps(rot: int, steps: Sequence[int], slots: int) -> List[int]:
+    remaining = rot & (slots - 1)
+    stride = 1
+    pieces: List[int] = []
+
+    for step in steps[:-1]:
+        digit = remaining % step
+        pieces.append(digit * stride)
+        remaining //= step
+        stride *= step
+
+    pieces.append(remaining * stride)
+    return pieces
+
+
+def _collect_rotation_breakdown_multistep(
+    a_diags: Iterable[int],
+    n: int,
+    steps: Sequence[int],
+    slots: int,
+    use_conjugation: bool = False,
+) -> Tuple[Set[int], List[Set[int]], int, float]:
+    if not steps:
+        raise ValueError("steps must not be empty")
+
+    product = 1
+    for step in steps:
+        if step <= 0:
+            raise ValueError("all steps must be positive")
+        product *= step
+    if product != slots:
+        raise ValueError(f"product(steps) must equal slots, got {product} vs {slots}")
+
+    stage_sets: List[Set[int]] = [set() for _ in steps]
+    total_online_rotations = 0
+    diag_count = 0
+
+    for raw_rot in a_diags:
+        diag_count += 1
+        pieces = _decompose_rotation_steps(raw_rot, steps, slots)
+        per_diag_non_zero = 0
+        for idx, piece in enumerate(pieces):
+            if piece == 0:
+                continue
+            rot_idx = norm_rot_index(piece, n)
+            if use_conjugation:
+                rot_idx = _canonical_conj_index(rot_idx, slots)
+            stage_sets[idx].add(rot_idx)
+            per_diag_non_zero += 1
+        total_online_rotations += per_diag_non_zero
+
+    needed_all: Set[int] = set()
+    for stage_set in stage_sets:
+        needed_all |= stage_set
+
+    avg_online_rotations = float(total_online_rotations) / float(diag_count) if diag_count > 0 else 0.0
+    return needed_all, stage_sets, total_online_rotations, avg_online_rotations
+
+
+def _score_strategy(
+    stat: Dict[str, object],
+    mode: str,
+    alpha: float,
+    beta: float,
+) -> Tuple[float, ...]:
+    new_cnt = len(stat["new_only"])
+    needed_cnt = len(stat["needed_all"])
+    online_total = int(stat.get("online_rotations_total", needed_cnt))
+    online_avg = float(stat.get("online_rotations_avg", float(needed_cnt)))
+
+    if mode == "strict-min-new":
+        return (new_cnt, needed_cnt, online_total, online_avg)
+    if mode == "weighted":
+        score = alpha * float(new_cnt) + beta * float(online_total)
+        stat["score"] = score
+        return (score, new_cnt, needed_cnt, online_total, online_avg)
+    raise ValueError(f"Unsupported mode: {mode}")
 
 
 def find_best_bstep_dual_mode(
@@ -158,13 +307,266 @@ def find_best_bstep_dual_mode(
     return chosen
 
 
+def find_best_bstep_structural_conj(
+    a_diags: List[int],
+    n: int,
+    bs_key: List[int],
+    slots: int = 2**15,
+    mode: str = "strict-min-new",
+    alpha: float = 1.0,
+    beta: float = 0.15,
+) -> Dict[str, object]:
+    best = None
+    for c in _candidate_bsteps(slots):
+        stat = evaluate_strategy_structural_conj(a_diags, n, bs_key, c, slots, name=f"scan_struct_n1={c}")
+        new_cnt = len(stat["new_only"])
+        needed_cnt = len(stat["needed_all"])
+
+        if mode == "strict-min-new":
+            metric = (new_cnt, needed_cnt, c)
+        elif mode == "weighted":
+            score = alpha * float(new_cnt) + beta * float(needed_cnt)
+            stat["score"] = score
+            metric = (score, new_cnt, needed_cnt, c)
+        else:
+            raise ValueError(f"Unsupported mode: {mode}")
+
+        if best is None or metric < best[0]:
+            best = (metric, stat)
+
+    chosen = best[1]
+    chosen["mode"] = mode
+    chosen["alpha"] = alpha
+    chosen["beta"] = beta
+    chosen["optimized_for"] = "structural-conj-fold"
+    return chosen
+
+
+def evaluate_strategy_multistep(
+    a_diags: List[int],
+    n: int,
+    bs_key: List[int],
+    steps: Sequence[int],
+    slots: int = 2**15,
+    name: str = "",
+    use_conjugation: bool = False,
+) -> Dict[str, object]:
+    needed_all, stage_sets, online_total, online_avg = _collect_rotation_breakdown_multistep(
+        a_diags,
+        n,
+        steps,
+        slots,
+        use_conjugation=use_conjugation,
+    )
+    bs_norm = _collapse_with_conjugation(bs_key, slots) if use_conjugation else {norm_rot_index(x & (slots - 1), n) for x in bs_key}
+    new_only = needed_all - bs_norm
+    final_keyindex = new_only | bs_norm
+
+    stat: Dict[str, object] = {
+        "strategy": name or f"multistep={tuple(steps)}",
+        "steps": tuple(steps),
+        "levels": len(steps),
+        "needed_all": needed_all,
+        "new_only": new_only,
+        "reused": needed_all & bs_norm,
+        "bs_norm": bs_norm,
+        "final_keyindex": final_keyindex,
+        "needed_stages": stage_sets,
+        "online_rotations_total": online_total,
+        "online_rotations_avg": online_avg,
+        "use_conjugation": use_conjugation,
+    }
+
+    for idx, stage_set in enumerate(stage_sets, start=1):
+        stat[f"needed_stage_{idx}"] = stage_set
+
+    if len(steps) == 2:
+        stat["b_step"] = steps[0]
+        stat["g_step"] = steps[1]
+        stat["needed_baby"] = stage_sets[0]
+        stat["needed_giant"] = stage_sets[1]
+    else:
+        stat["needed_baby"] = stage_sets[0]
+        stat["needed_giant"] = stage_sets[-1]
+
+    return stat
+
+
+def find_best_multistep_strategy(
+    a_diags: List[int],
+    n: int,
+    bs_key: List[int],
+    slots: int = 2**15,
+    levels: int = 3,
+    mode: str = "weighted",
+    alpha: float = 1.0,
+    beta: float = 0.15,
+    use_conjugation: bool = False,
+    min_log_step: int = 1,
+) -> Dict[str, object]:
+    total_log_slots = slots.bit_length() - 1
+    if (1 << total_log_slots) != slots:
+        raise ValueError("find_best_multistep_strategy currently expects slots to be a power of two")
+
+    best = None
+    for steps in _factorizations_of_power_of_two(total_log_slots, levels, min_log_step=min_log_step):
+        stat = evaluate_strategy_multistep(
+            a_diags,
+            n,
+            bs_key,
+            steps,
+            slots=slots,
+            name=f"scan_multistep(levels={levels},steps={steps})",
+            use_conjugation=use_conjugation,
+        )
+        metric = _score_strategy(stat, mode, alpha, beta)
+        metric = metric + (steps,)
+
+        if best is None or metric < best[0]:
+            best = (metric, stat)
+
+    chosen = best[1]
+    chosen["mode"] = mode
+    chosen["alpha"] = alpha
+    chosen["beta"] = beta
+    chosen["optimized_for"] = "multistep-conj" if use_conjugation else "multistep"
+    return chosen
+
+
 def print_stats(title: str, stat: Dict[str, object]) -> None:
     print(f"[{title}] strategy={stat['strategy']}")
-    print(f"bStep={stat['b_step']}, gStep={stat['g_step']}")
+    if "steps" in stat:
+        print(f"steps={stat['steps']}, levels={stat['levels']}")
+    else:
+        print(f"bStep={stat['b_step']}, gStep={stat['g_step']}")
     print(f"needed_all={len(stat['needed_all'])}, new_only={len(stat['new_only'])}, reused={len(stat['reused'])}")
     print(f"needed_baby={len(stat['needed_baby'])}, needed_giant={len(stat['needed_giant'])}")
+    if "online_rotations_total" in stat:
+        print(f"online_rotations_total={stat['online_rotations_total']}, online_rotations_avg={stat['online_rotations_avg']:.4f}")
     if "score" in stat:
-        print(f"score(alpha*new + beta*needed)={stat['score']:.4f} (alpha={stat['alpha']}, beta={stat['beta']})")
+        print(f"score(alpha*new + beta*online_total)={stat['score']:.4f} (alpha={stat['alpha']}, beta={stat['beta']})")
+
+
+def _format_steps_for_table(stat: Dict[str, object]) -> str:
+    if "steps" in stat:
+        return " x ".join(str(x) for x in stat["steps"])
+    if "b_step" in stat and "g_step" in stat:
+        return f"{stat['b_step']} x {stat['g_step']}"
+    return "-"
+
+
+def _collect_stage_sizes(stat: Dict[str, object]) -> str:
+    stage_sets = stat.get("needed_stages")
+    if stage_sets is not None:
+        return "/".join(str(len(x)) for x in stage_sets)
+    parts: List[str] = []
+    if "needed_baby" in stat:
+        parts.append(str(len(stat["needed_baby"])))
+    if "needed_giant" in stat:
+        parts.append(str(len(stat["needed_giant"])))
+    return "/".join(parts) if parts else "-"
+
+
+def print_strategy_table(title: str, rows: Sequence[Tuple[str, Dict[str, object]]]) -> None:
+    headers = [
+        "label",
+        "steps",
+        "levels",
+        "stage_sizes",
+        "avg_rot",
+        "needed",
+        "new",
+        "reused",
+        "final",
+        "score",
+    ]
+    table_rows: List[List[str]] = []
+    for label, stat in rows:
+        score = stat.get("score")
+        table_rows.append([
+            label,
+            _format_steps_for_table(stat),
+            str(stat.get("levels", 2)),
+            _collect_stage_sizes(stat),
+            f"{float(stat.get('online_rotations_avg', 2.0)):.4f}",
+            str(len(stat["needed_all"])),
+            str(len(stat["new_only"])),
+            str(len(stat["reused"])),
+            str(len(stat.get("final_keyindex", stat["new_only"] | stat["bs_norm"]))),
+            f"{float(score):.4f}" if score is not None else "-",
+        ])
+
+    widths = [len(header) for header in headers]
+    for row in table_rows:
+        for idx, value in enumerate(row):
+            widths[idx] = max(widths[idx], len(value))
+
+    def fmt(row: Sequence[str]) -> str:
+        return " | ".join(value.ljust(widths[idx]) for idx, value in enumerate(row))
+
+    print(f"\n[{title}]")
+    print(fmt(headers))
+    print("-+-".join("-" * width for width in widths))
+    for row in table_rows:
+        print(fmt(row))
+
+
+def _format_int_values(values: Iterable[int]) -> str:
+    return " ".join(str(x) for x in sorted(values))
+
+
+def _strategy_csv_row(experiment: str, label: str, stat: Dict[str, object]) -> Dict[str, object]:
+    final_keyindex = stat.get("final_keyindex", stat["new_only"] | stat["bs_norm"])
+    score = stat.get("score")
+    return {
+        "experiment": experiment,
+        "label": label,
+        "strategy": stat["strategy"],
+        "mode": stat.get("mode", ""),
+        "optimized_for": stat.get("optimized_for", ""),
+        "use_conjugation": stat.get("use_conjugation", ""),
+        "levels": stat.get("levels", 2),
+        "steps": _format_steps_for_table(stat),
+        "stage_sizes": _collect_stage_sizes(stat),
+        "alpha": stat.get("alpha", ""),
+        "beta": stat.get("beta", ""),
+        "score": f"{float(score):.8f}" if score is not None else "",
+        "needed_count": len(stat["needed_all"]),
+        "new_count": len(stat["new_only"]),
+        "reused_count": len(stat["reused"]),
+        "final_keyindex_count": len(final_keyindex),
+        "online_rotations_total": stat.get("online_rotations_total", ""),
+        "online_rotations_avg": f"{float(stat['online_rotations_avg']):.8f}" if "online_rotations_avg" in stat else "",
+        "needed_baby_count": len(stat["needed_baby"]) if "needed_baby" in stat else "",
+        "needed_giant_count": len(stat["needed_giant"]) if "needed_giant" in stat else "",
+        "needed_all": _format_int_values(stat["needed_all"]),
+        "new_only": _format_int_values(stat["new_only"]),
+        "reused": _format_int_values(stat["reused"]),
+        "final_keyindex": _format_int_values(final_keyindex),
+    }
+
+
+def write_results_csv(path: Path, rows: Sequence[Dict[str, object]]) -> None:
+    if not rows:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = list(rows[0].keys())
+    with path.open("w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def _best_scored_row(rows: Sequence[Tuple[str, Dict[str, object]]]) -> Tuple[str, Dict[str, object]]:
+    return min(
+        rows,
+        key=lambda item: (
+            float(item[1].get("score", 0.0)),
+            len(item[1]["new_only"]),
+            int(item[1].get("online_rotations_total", 0)),
+            len(item[1]["needed_all"]),
+        ),
+    )
 
 
 def _parse_list_of_lists(raw: str) -> List[List[int]]:
@@ -472,6 +874,18 @@ if __name__ == "__main__":
     per_list_baby_union_conj: Set[int] = set()
     per_list_giant_union_conj: Set[int] = set()
 
+    per_list_needed_union_struct: Set[int] = set()
+    per_list_new_union_struct: Set[int] = set()
+    per_list_final_union_struct: Set[int] = set()
+    per_list_baby_union_struct: Set[int] = set()
+    per_list_giant_union_struct: Set[int] = set()
+
+    per_list_needed_union_struct_opt: Set[int] = set()
+    per_list_new_union_struct_opt: Set[int] = set()
+    per_list_final_union_struct_opt: Set[int] = set()
+    per_list_baby_union_struct_opt: Set[int] = set()
+    per_list_giant_union_struct_opt: Set[int] = set()
+
     for idx, diag_list in enumerate(a_diags_groups, start=1):
         b_step_each = _find_best_bsgs_ratio(diag_list, slots, log_max_ratio=0)
         stat_each = evaluate_strategy(
@@ -496,6 +910,33 @@ if __name__ == "__main__":
         per_list_final_union_conj |= stat_each_conj["final_keyindex"]
         per_list_baby_union_conj |= stat_each_conj["needed_baby"]
         per_list_giant_union_conj |= stat_each_conj["needed_giant"]
+
+        stat_each_struct = evaluate_strategy_structural_conj(
+            diag_list,
+            n,
+            bsKey,
+            b_step_each,
+            slots,
+            name=f"baseline_ratio(per_list)[group={idx}]+structural_conj",
+        )
+        per_list_needed_union_struct |= stat_each_struct["needed_all"]
+        per_list_new_union_struct |= stat_each_struct["new_only"]
+        per_list_final_union_struct |= stat_each_struct["new_only"] | stat_each_struct["bs_norm"]
+        per_list_baby_union_struct |= stat_each_struct["needed_baby"]
+        per_list_giant_union_struct |= stat_each_struct["needed_giant"]
+
+        stat_each_struct_opt = find_best_bstep_structural_conj(
+            diag_list,
+            n,
+            bsKey,
+            slots,
+            mode="strict-min-new",
+        )
+        per_list_needed_union_struct_opt |= stat_each_struct_opt["needed_all"]
+        per_list_new_union_struct_opt |= stat_each_struct_opt["new_only"]
+        per_list_final_union_struct_opt |= stat_each_struct_opt["new_only"] | stat_each_struct_opt["bs_norm"]
+        per_list_baby_union_struct_opt |= stat_each_struct_opt["needed_baby"]
+        per_list_giant_union_struct_opt |= stat_each_struct_opt["needed_giant"]
 
         # print(f"\n[GROUP {idx}] size={len(diag_list)}")
         # print_stats("BASE", stat_each)
@@ -529,6 +970,38 @@ if __name__ == "__main__":
     if len(per_list_needed_union) > 0:
         print("key_count_reduction_ratio_vs_base_union:", f"{(len(per_list_needed_union) - len(per_list_needed_union_conj)) / len(per_list_needed_union):.4%}")
 
+    print("\n[MODE A NEW: STRUCTURAL-CONJ-FOLD]")
+    print("needed_all_union_count_struct:", len(per_list_needed_union_struct))
+    print("needed_baby_union_count_struct:", len(per_list_baby_union_struct))
+    print("needed_giant_union_count_struct:", len(per_list_giant_union_struct))
+    print("new_only_union_count_struct:", len(per_list_new_union_struct))
+    print("final_keyindex_union_count_struct:", len(per_list_final_union_struct))
+    print("needed_baby_union_sorted_struct:", _sorted_int_set(per_list_baby_union_struct))
+    print("needed_giant_union_sorted_struct:", _sorted_int_set(per_list_giant_union_struct))
+    print("needed_all_union_sorted_struct:", _sorted_int_set(per_list_needed_union_struct))
+    print("new_only_union_sorted_struct:", _sorted_int_set(per_list_new_union_struct))
+    print("final_keyindex_union_sorted_struct:", _sorted_int_set(per_list_final_union_struct))
+
+    print("key_count_reduction_vs_base_union_struct:", len(per_list_needed_union) - len(per_list_needed_union_struct))
+    if len(per_list_needed_union) > 0:
+        print("key_count_reduction_ratio_vs_base_union_struct:", f"{(len(per_list_needed_union) - len(per_list_needed_union_struct)) / len(per_list_needed_union):.4%}")
+
+    print("\n[MODE A NEW: STRUCTURAL-CONJ-FOLD-OPT-BSTEP]")
+    print("needed_all_union_count_struct_opt:", len(per_list_needed_union_struct_opt))
+    print("needed_baby_union_count_struct_opt:", len(per_list_baby_union_struct_opt))
+    print("needed_giant_union_count_struct_opt:", len(per_list_giant_union_struct_opt))
+    print("new_only_union_count_struct_opt:", len(per_list_new_union_struct_opt))
+    print("final_keyindex_union_count_struct_opt:", len(per_list_final_union_struct_opt))
+    print("needed_baby_union_sorted_struct_opt:", _sorted_int_set(per_list_baby_union_struct_opt))
+    print("needed_giant_union_sorted_struct_opt:", _sorted_int_set(per_list_giant_union_struct_opt))
+    print("needed_all_union_sorted_struct_opt:", _sorted_int_set(per_list_needed_union_struct_opt))
+    print("new_only_union_sorted_struct_opt:", _sorted_int_set(per_list_new_union_struct_opt))
+    print("final_keyindex_union_sorted_struct_opt:", _sorted_int_set(per_list_final_union_struct_opt))
+
+    print("key_count_reduction_vs_base_union_struct_opt:", len(per_list_needed_union) - len(per_list_needed_union_struct_opt))
+    if len(per_list_needed_union) > 0:
+        print("key_count_reduction_ratio_vs_base_union_struct_opt:", f"{(len(per_list_needed_union) - len(per_list_needed_union_struct_opt)) / len(per_list_needed_union):.4%}")
+
     # Mode B: merge all lists, deduplicate, then run one simulation.
     raw_total = sum(len(g) for g in a_diags_groups)
     merged_a_diags = sorted({x & (slots - 1) for g in a_diags_groups for x in g})
@@ -561,6 +1034,23 @@ if __name__ == "__main__":
     print("key reused:", set(stat_merged["needed_all"]) & set(bsKey))
 
     stat_merged_conj = evaluate_with_conjugation(stat_merged, bsKey, slots)
+
+    stat_merged_struct = evaluate_strategy_structural_conj(
+        merged_a_diags,
+        n,
+        bsKey,
+        b_step_merged,
+        slots,
+        name="baseline_ratio(merged_dedup_A)+structural_conj",
+    )
+
+    stat_merged_struct_opt = find_best_bstep_structural_conj(
+        merged_a_diags,
+        n,
+        bsKey,
+        slots,
+        mode="strict-min-new",
+    )
     print("\n[MODE B NEW: CONJUGATION-3STEP]")
     print(f"[CONJ] strategy={stat_merged_conj['strategy']}")
     print(f"bStep={stat_merged_conj['b_step']}, gStep={stat_merged_conj['g_step']}")
@@ -575,3 +1065,133 @@ if __name__ == "__main__":
     if len(stat_merged["needed_all"]) > 0:
         print("key_count_reduction_ratio_vs_base:", f"{(len(stat_merged["needed_all"]) - len(stat_merged_conj["needed_all"])) / len(stat_merged["needed_all"]):.4%}")
     print("final_keyindex_count_conj:", len(stat_merged_conj["final_keyindex"]))
+
+    print("\n[MODE B NEW: STRUCTURAL-CONJ-FOLD]")
+    print(f"[STRUCT] strategy={stat_merged_struct['strategy']}")
+    print(f"bStep={stat_merged_struct['b_step']}, gStep={stat_merged_struct['g_step']}")
+    print(f"needed_all={len(stat_merged_struct['needed_all'])}, new_only={len(stat_merged_struct['new_only'])}, reused={len(stat_merged_struct['reused'])}")
+    print(f"needed_baby={len(stat_merged_struct['needed_baby'])}, needed_giant={len(stat_merged_struct['needed_giant'])}")
+    print("needed_baby_sorted_struct:", _sorted_int_set(stat_merged_struct["needed_baby"]))
+    print("needed_giant_sorted_struct:", _sorted_int_set(stat_merged_struct["needed_giant"]))
+    print("needed_all_sorted_struct:", _sorted_int_set(stat_merged_struct["needed_all"]))
+    print("new_only_sorted_struct:", _sorted_int_set(stat_merged_struct["new_only"]))
+    final_keyindex_struct = stat_merged_struct["new_only"] | stat_merged_struct["bs_norm"]
+    print("final_keyindex_sorted_struct:", _sorted_int_set(final_keyindex_struct))
+    print("key_count_reduction_vs_base_struct:", len(stat_merged["needed_all"]) - len(stat_merged_struct["needed_all"]))
+    if len(stat_merged["needed_all"]) > 0:
+        print("key_count_reduction_ratio_vs_base_struct:", f"{(len(stat_merged["needed_all"]) - len(stat_merged_struct["needed_all"])) / len(stat_merged["needed_all"]):.4%}")
+    print("final_keyindex_count_struct:", len(final_keyindex_struct))
+
+    print("\n[MODE B NEW: STRUCTURAL-CONJ-FOLD-OPT-BSTEP]")
+    print(f"[STRUCT-OPT] strategy={stat_merged_struct_opt['strategy']}")
+    print(f"bStep={stat_merged_struct_opt['b_step']}, gStep={stat_merged_struct_opt['g_step']}")
+    print(f"needed_all={len(stat_merged_struct_opt['needed_all'])}, new_only={len(stat_merged_struct_opt['new_only'])}, reused={len(stat_merged_struct_opt['reused'])}")
+    print(f"needed_baby={len(stat_merged_struct_opt['needed_baby'])}, needed_giant={len(stat_merged_struct_opt['needed_giant'])}")
+    print("needed_baby_sorted_struct_opt:", _sorted_int_set(stat_merged_struct_opt["needed_baby"]))
+    print("needed_giant_sorted_struct_opt:", _sorted_int_set(stat_merged_struct_opt["needed_giant"]))
+    print("needed_all_sorted_struct_opt:", _sorted_int_set(stat_merged_struct_opt["needed_all"]))
+    print("new_only_sorted_struct_opt:", _sorted_int_set(stat_merged_struct_opt["new_only"]))
+    final_keyindex_struct_opt = stat_merged_struct_opt["new_only"] | stat_merged_struct_opt["bs_norm"]
+    print("final_keyindex_sorted_struct_opt:", _sorted_int_set(final_keyindex_struct_opt))
+    print("key_count_reduction_vs_base_struct_opt:", len(stat_merged["needed_all"]) - len(stat_merged_struct_opt["needed_all"]))
+    if len(stat_merged["needed_all"]) > 0:
+        print("key_count_reduction_ratio_vs_base_struct_opt:", f"{(len(stat_merged["needed_all"]) - len(stat_merged_struct_opt["needed_all"])) / len(stat_merged["needed_all"]):.4%}")
+    print("final_keyindex_count_struct_opt:", len(final_keyindex_struct_opt))
+
+    multi_step_results: List[Tuple[str, Dict[str, object]]] = []
+    print("\n===== MODE B: MULTI-STEP SEARCH =====")
+    for levels in (2, 3, 4):
+        best_multi = find_best_multistep_strategy(
+            merged_a_diags,
+            n,
+            bsKey,
+            slots=slots,
+            levels=levels,
+            mode="weighted",
+            alpha=1.0,
+            beta=3.0,
+            use_conjugation=False,
+        )
+        multi_step_results.append((f"multi-{levels}", best_multi))
+        print_stats(f"MULTI-{levels}STEP", best_multi)
+        for stage_idx, stage_set in enumerate(best_multi["needed_stages"], start=1):
+            print(f"needed_stage_{stage_idx}_count:", len(stage_set))
+            print(f"needed_stage_{stage_idx}_sorted:", _sorted_int_set(stage_set))
+        print("final_keyindex_count:", len(best_multi["final_keyindex"]))
+        print("final_keyindex_sorted:", _sorted_int_set(best_multi["final_keyindex"]))
+
+        best_multi_conj = find_best_multistep_strategy(
+            merged_a_diags,
+            n,
+            bsKey,
+            slots=slots,
+            levels=levels,
+            mode="weighted",
+            alpha=1.0,
+            beta=3.0,
+            use_conjugation=True,
+        )
+        multi_step_results.append((f"multi-{levels}-conj", best_multi_conj))
+        print_stats(f"MULTI-{levels}STEP-CONJ", best_multi_conj)
+        for stage_idx, stage_set in enumerate(best_multi_conj["needed_stages"], start=1):
+            print(f"needed_stage_{stage_idx}_count_conj:", len(stage_set))
+            print(f"needed_stage_{stage_idx}_sorted_conj:", _sorted_int_set(stage_set))
+        print("final_keyindex_count_conj:", len(best_multi_conj["final_keyindex"]))
+        print("final_keyindex_sorted_conj:", _sorted_int_set(best_multi_conj["final_keyindex"]))
+
+    base_summary = dict(stat_merged)
+    base_summary["final_keyindex"] = final_keyindex_merged
+    base_summary["online_rotations_avg"] = 2.0
+    base_summary["online_rotations_total"] = 2 * len(merged_a_diags)
+    conj_summary = dict(stat_merged_conj)
+    conj_summary["online_rotations_avg"] = 3.0
+    conj_summary["online_rotations_total"] = 3 * len(merged_a_diags)
+    struct_summary = dict(stat_merged_struct)
+    struct_summary["final_keyindex"] = final_keyindex_struct
+    struct_summary["online_rotations_avg"] = 3.0
+    struct_summary["online_rotations_total"] = 3 * len(merged_a_diags)
+    struct_opt_summary = dict(stat_merged_struct_opt)
+    struct_opt_summary["final_keyindex"] = final_keyindex_struct_opt
+    struct_opt_summary["online_rotations_avg"] = 3.0
+    struct_opt_summary["online_rotations_total"] = 3 * len(merged_a_diags)
+
+    comparison_rows: List[Tuple[str, Dict[str, object]]] = [
+        ("base-2step", base_summary),
+        ("conj-post", conj_summary),
+        ("struct-conj", struct_summary),
+        ("struct-conj-opt", struct_opt_summary),
+    ] + multi_step_results
+    print_strategy_table("MODE B COMPARISON TABLE", comparison_rows)
+
+    csv_rows: List[Dict[str, object]] = [
+        _strategy_csv_row("mode_b_comparison", label, stat)
+        for label, stat in comparison_rows
+    ]
+
+    beta_sweep_best_rows: List[Tuple[str, Dict[str, object]]] = []
+    for beta in BETA_SWEEP_VALUES:
+        sweep_candidates: List[Tuple[str, Dict[str, object]]] = []
+        for levels in (2, 3, 4):
+            for use_conjugation in (False, True):
+                sweep_stat = find_best_multistep_strategy(
+                    merged_a_diags,
+                    n,
+                    bsKey,
+                    slots=slots,
+                    levels=levels,
+                    mode="weighted",
+                    alpha=1.0,
+                    beta=beta,
+                    use_conjugation=use_conjugation,
+                )
+                sweep_label = f"multi-{levels}{'-conj' if use_conjugation else ''}"
+                sweep_candidates.append((sweep_label, sweep_stat))
+                csv_rows.append(_strategy_csv_row("beta_sweep_candidate", sweep_label, sweep_stat))
+
+        best_label, best_stat = _best_scored_row(sweep_candidates)
+        beta_sweep_best_rows.append((f"beta={beta:g}:{best_label}", best_stat))
+        csv_rows.append(_strategy_csv_row("beta_sweep_best", best_label, best_stat))
+
+    print_strategy_table("BETA SWEEP BEST BY WEIGHT", beta_sweep_best_rows)
+    write_results_csv(RESULTS_CSV_PATH, csv_rows)
+    print(f"\n[CSV] wrote {len(csv_rows)} rows to {RESULTS_CSV_PATH}")
