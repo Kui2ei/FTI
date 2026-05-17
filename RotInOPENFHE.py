@@ -62,6 +62,7 @@ def GetCollapsedFFTParams(slots,levelBudget = 4, dim1 = 0):
         gRem = 1 << shiftBaseRem
         bRem = (numRotationsRem + 1) // gRem
     else:
+        shiftBaseRem = 0
         gRem = 0
         bRem = 0
     
@@ -69,9 +70,12 @@ def GetCollapsedFFTParams(slots,levelBudget = 4, dim1 = 0):
             "layersCollapse":layersCollapse,
             "remCollapse":remCollapse,
             "numRotations":numRotations,
+            "shiftBase":shiftBase,
+            "gDefault":gDefault,
             "b":b,
             "g":g,
             "numRotationsRem":numRotationsRem,
+            "shiftBaseRem":shiftBaseRem,
             "bRem":bRem,
             "gRem":gRem}
             
@@ -91,11 +95,74 @@ def ReduceRotation(index: int, slots: int) -> int:
         return index + islots + ((abs(index) >> n) << n)
 
     return (islots + index % islots) % islots
+
+
+def FoldRotationIndex(index: int, modulus: int) -> int:
+    imodulus = int(modulus)
+    if imodulus <= 0:
+        raise ValueError("modulus must be positive")
+
+    folded = int(index) % imodulus
+    if folded >= (imodulus + 1) // 2:
+        return folded - imodulus
+    return folded
+
+
+def FoldRotationIndices(indices, modulus: int):
+    return sorted(
+        {FoldRotationIndex(index, modulus) for index in indices},
+        key=lambda index: (abs(index), index < 0),
+    )
+
+
+def PrintBSGSParamSelection(name: str, params, dim1: int):
+    print(f"{name} BSGS params:")
+    print(
+        "  full layers: "
+        f"numRotations={params['numRotations']}, "
+        f"shiftBase={params['shiftBase']}, "
+        f"gDefault=2^shiftBase={params['gDefault']}, "
+        f"dim1={dim1}, "
+        f"g={params['g']}, "
+        f"b=(numRotations+1)//g={params['b']}"
+    )
+    if params["remCollapse"] != 0:
+        print(
+            "  rem layer: "
+            f"numRotationsRem={params['numRotationsRem']}, "
+            f"shiftBaseRem={params['shiftBaseRem']}, "
+            f"gRem=2^shiftBaseRem={params['gRem']}, "
+            f"bRem=(numRotationsRem+1)//gRem={params['bRem']}"
+        )
+
+
+def PrintBSGSStep(
+    name: str,
+    layer,
+    b: int,
+    g: int,
+    halfRots: int,
+    scalingFactor: int,
+    rawBabySteps,
+    babySteps,
+    rawGiantSteps,
+    giantSteps,
+    modulus: int,
+):
+    print(
+        f"{name} layer {layer}: "
+        f"b={b}, g={g}, halfRots={halfRots}, scalingFactor={scalingFactor}"
+    )
+    print(f"  raw babyStep:   {rawBabySteps}")
+    print(f"  folded babyStep: {FoldRotationIndices(babySteps, modulus)}")
+    print(f"  raw giantStep:  {rawGiantSteps}")
+    print(f"  folded giantStep: {FoldRotationIndices(giantSteps, modulus)}")
         
 def FindCoeffsToSlotsRotationIndices(slots: int, M: int, lb:int, dim1:int = 0):
     slots = int(slots)
     M = int(M)
     params = GetCollapsedFFTParams(slots,lb,dim1)
+    PrintBSGSParamSelection("FindCoeffsToSlotsRotationIndices", params, dim1)
 
     levelBudget = int(params["levelBudget"])
     layersCollapse = int(params["layersCollapse"])
@@ -117,25 +184,75 @@ def FindCoeffsToSlotsRotationIndices(slots: int, M: int, lb:int, dim1:int = 0):
     for s in range(levelBudget - 1, flagRem - 1, -1):
         scalingFactor = 1 << ((s - flagRem) * layersCollapse + remCollapse)
         halfRots = 1 - ((numRotations + 1) // 2)
+        rawBabySteps = []
+        babySteps = []
+        rawGiantSteps = []
+        giantSteps = []
         for j in range(halfRots, g + halfRots):
-            indexList.append(ReduceRotation(j * scalingFactor, slots))
+            rawIndex = j * scalingFactor
+            rawBabySteps.append(rawIndex)
+            babySteps.append(ReduceRotation(rawIndex, slots))
         for i in range(b):
-            indexList.append(ReduceRotation((g * i) * scalingFactor, M // 4))
+            rawIndex = (g * i) * scalingFactor
+            rawGiantSteps.append(rawIndex)
+            giantSteps.append(ReduceRotation(rawIndex, M // 4))
+        PrintBSGSStep(
+            "FindCoeffsToSlotsRotationIndices",
+            s,
+            b,
+            g,
+            halfRots,
+            scalingFactor,
+            rawBabySteps,
+            babySteps,
+            rawGiantSteps,
+            giantSteps,
+            M // 4,
+        )
+        indexList.extend(babySteps)
+        indexList.extend(giantSteps)
 
     if flagRem:
         halfRots = 1 - ((numRotationsRem + 1) // 2)
+        scalingFactor = 1
+        rawBabySteps = []
+        babySteps = []
+        rawGiantSteps = []
+        giantSteps = []
         for j in range(halfRots, gRem + halfRots):
-            indexList.append(ReduceRotation(j, slots))
+            rawIndex = j
+            rawBabySteps.append(rawIndex)
+            babySteps.append(ReduceRotation(rawIndex, slots))
         for i in range(bRem):
-            indexList.append(ReduceRotation(gRem * i, M // 4))
+            rawIndex = gRem * i
+            rawGiantSteps.append(rawIndex)
+            giantSteps.append(ReduceRotation(rawIndex, M // 4))
+        PrintBSGSStep(
+            "FindCoeffsToSlotsRotationIndices",
+            "rem",
+            bRem,
+            gRem,
+            halfRots,
+            scalingFactor,
+            rawBabySteps,
+            babySteps,
+            rawGiantSteps,
+            giantSteps,
+            M // 4,
+        )
+        indexList.extend(babySteps)
+        indexList.extend(giantSteps)
 
     m = slots * 4
     if m != M:
         ratio = M // m
         j = 1
+        extraRotations = []
         while j < ratio:
-            indexList.append(j * slots)
+            extraRotations.append(j * slots)
             j <<= 1
+        print("FindCoeffsToSlotsRotationIndices extraRotations: ", FoldRotationIndices(extraRotations, M // 4))
+        indexList.extend(extraRotations)
 
     return indexList
 
@@ -144,6 +261,7 @@ def FindSlotsToCoeffsRotationIndices(slots: int, M: int, lb:int, dim1:int = 0):
     slots = int(slots)
     M = int(M)
     params = GetCollapsedFFTParams(slots,lb,dim1)
+    PrintBSGSParamSelection("FindSlotsToCoeffsRotationIndices", params, dim1)
 
     levelBudget = int(params["levelBudget"])
     layersCollapse = int(params["layersCollapse"])
@@ -167,27 +285,76 @@ def FindSlotsToCoeffsRotationIndices(slots: int, M: int, lb:int, dim1:int = 0):
     for s in range(0, levelBudget - flagRem):
         scalingFactor = 1 << (s * layersCollapse)
         halfRots = 1 - ((numRotations + 1) // 2)
+        rawBabySteps = []
+        babySteps = []
+        rawGiantSteps = []
+        giantSteps = []
         for j in range(halfRots, g + halfRots):
-            indexList.append(ReduceRotation(j * scalingFactor, M // 4))
+            rawIndex = j * scalingFactor
+            rawBabySteps.append(rawIndex)
+            babySteps.append(ReduceRotation(rawIndex, M // 4))
         for i in range(b):
-            indexList.append(ReduceRotation((g * i) * scalingFactor, M // 4))
+            rawIndex = (g * i) * scalingFactor
+            rawGiantSteps.append(rawIndex)
+            giantSteps.append(ReduceRotation(rawIndex, M // 4))
+        PrintBSGSStep(
+            "FindSlotsToCoeffsRotationIndices",
+            s,
+            b,
+            g,
+            halfRots,
+            scalingFactor,
+            rawBabySteps,
+            babySteps,
+            rawGiantSteps,
+            giantSteps,
+            M // 4,
+        )
+        indexList.extend(babySteps)
+        indexList.extend(giantSteps)
 
     if flagRem:
         s = levelBudget - flagRem
         scalingFactor = 1 << (s * layersCollapse)
         halfRots = 1 - ((numRotationsRem + 1) // 2)
+        rawBabySteps = []
+        babySteps = []
+        rawGiantSteps = []
+        giantSteps = []
         for j in range(halfRots, gRem + halfRots):
-            indexList.append(ReduceRotation(j * scalingFactor, M // 4))
+            rawIndex = j * scalingFactor
+            rawBabySteps.append(rawIndex)
+            babySteps.append(ReduceRotation(rawIndex, M // 4))
         for i in range(bRem):
-            indexList.append(ReduceRotation((gRem * i) * scalingFactor, M // 4))
+            rawIndex = (gRem * i) * scalingFactor
+            rawGiantSteps.append(rawIndex)
+            giantSteps.append(ReduceRotation(rawIndex, M // 4))
+        PrintBSGSStep(
+            "FindSlotsToCoeffsRotationIndices",
+            "rem",
+            bRem,
+            gRem,
+            halfRots,
+            scalingFactor,
+            rawBabySteps,
+            babySteps,
+            rawGiantSteps,
+            giantSteps,
+            M // 4,
+        )
+        indexList.extend(babySteps)
+        indexList.extend(giantSteps)
 
     m = slots * 4
     if m != M:
         ratio = M // m
         j = 1
+        extraRotations = []
         while j < ratio:
-            indexList.append(j * slots)
+            extraRotations.append(j * slots)
             j <<= 1
+        print("FindSlotsToCoeffsRotationIndices extraRotations: ", FoldRotationIndices(extraRotations, M // 4))
+        indexList.extend(extraRotations)
     return indexList
 
 def FindLinearTransformRotationIndices(slots: int, M: int, dim1:int = 0):
@@ -217,14 +384,14 @@ def FindBootstrapRotationIndices(slots: int, M: int, lb1:int, lb2:int, dim1 = [0
         res.extend(FindLinearTransformRotationIndices(slots, M, dim1[0]))
     else:
         res.extend(FindCoeffsToSlotsRotationIndices(slots, M, lb1, dim1[0]))
-        print(f"FindCoeffsToSlotsRotationIndices: ", sorted(set(res)))
+        print(f"FindCoeffsToSlotsRotationIndices: ", FoldRotationIndices(res, M // 4))
         a = FindSlotsToCoeffsRotationIndices(slots, M, lb2, dim1[1])
-        print(f"FindSlotsToCoeffsRotationIndices: ",sorted(set(a)))
+        print(f"FindSlotsToCoeffsRotationIndices: ", FoldRotationIndices(a, M // 4))
         res.extend(a)
     res = set(res)
     res.discard(0)
     res.discard(M//4)
-    return list(sorted(res))
+    return FoldRotationIndices(res, M // 4)
 
 def RotInOPENFHE(logN,logSlots,levelBudget = [3,3], dim1 = [0,0]):
     if levelBudget[0] > logSlots or levelBudget[1] > logSlots:
@@ -236,6 +403,6 @@ def RotInOPENFHE(logN,logSlots,levelBudget = [3,3], dim1 = [0,0]):
     return FindBootstrapRotationIndices(slots, N*2, levelBudget[0], levelBudget[1], dim1)
 
 
-a = RotInOPENFHE(7,6)  # Example usage
+a = RotInOPENFHE(11,10, [3,3])  # Example usage
 print(a)
 print(len(a))
